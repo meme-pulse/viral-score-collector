@@ -4,6 +4,7 @@ import { scoreCalculator } from '../services/score-calculator';
 import { scoreSigner, ScoreSigner } from '../services/signer';
 import { merkleBuilder } from '../services/merkle-builder';
 import { broadcastMerkleUpdate } from '../ws/stream';
+import { db, schema } from '../db/client';
 import type { Hex } from 'viem';
 
 /**
@@ -28,6 +29,39 @@ let backfillCompleted = false;
 const latestTokenScores = new Map<string, number>();
 
 /**
+ * Save token scores to database
+ */
+async function saveTokenScoresToDB(scores: Map<string, number>, aggregatedMetrics: any[]): Promise<void> {
+  const metricsMap = new Map(aggregatedMetrics.map(m => [m.tokenSymbol, m]));
+
+  for (const [tokenSymbol, score] of scores) {
+    const metrics = metricsMap.get(tokenSymbol);
+    if (!metrics) continue;
+
+    try {
+      await db.insert(schema.tokenScores).values({
+        tokenSymbol,
+        score,
+        rawPosts: metrics.posts,
+        rawViews: metrics.views,
+        rawLikes: metrics.likes,
+        rawReposts: metrics.reposts,
+        rawReplies: metrics.replies,
+        rawUniqueUsers: metrics.uniqueUsers,
+        avgBondingCurve: metrics.avgBondingCurve || 0,
+        graduatedRatio: metrics.graduatedRatio || 0,
+        imageRatio: metrics.imageRatio || 0,
+      });
+    } catch (error) {
+      // Ignore unique constraint errors (token already has score in this second)
+      if (!error.message?.includes('duplicate')) {
+        console.error(`[Scheduler] Error saving token score for ${tokenSymbol}:`, error);
+      }
+    }
+  }
+}
+
+/**
  * Process score collection - calculates individual token scores
  */
 async function processScoreCollection(): Promise<void> {
@@ -45,13 +79,16 @@ async function processScoreCollection(): Promise<void> {
     // 2. Calculate individual token scores
     const scores = scoreCalculator.calculateBatch(aggregatedMetrics);
 
-    // 3. Update latest token scores map (in-memory, no signing for individual tokens)
+    // 3. Update latest token scores map (in-memory)
     for (const [tokenSymbol, score] of scores) {
       latestTokenScores.set(tokenSymbol, score);
       console.log(`[Scheduler] ${tokenSymbol}: score=${score}, tier=${scoreCalculator.getScoreTier(score)}`);
     }
 
-    console.log(`[Scheduler] Score collection complete. ${scores.size} tokens updated`);
+    // 4. Save token scores to database for persistence and historical tracking
+    await saveTokenScoresToDB(scores, aggregatedMetrics);
+
+    console.log(`[Scheduler] Score collection complete. ${scores.size} tokens updated and saved to DB`);
   } catch (error) {
     console.error('[Scheduler] Score collection failed:', error);
   }
@@ -70,7 +107,7 @@ async function processMerkleCheckpoint(): Promise<void> {
     }
 
     // Build merkle tree from token scores (for pair calculations)
-    const pairScoresMap = new Map<string, { poolId: Hex; score: number }>();
+    const pairScoresMap = new Map<string, { poolId: Hex; score: number; tokenX: string; tokenY: string; tokenXScore: number; tokenYScore: number }>();
 
     // Generate pair pool IDs for merkle tree
     const tokens = Array.from(latestTokenScores.keys());
@@ -82,7 +119,14 @@ async function processMerkleCheckpoint(): Promise<void> {
         if (pairResult) {
           const poolId = ScoreSigner.generatePairPoolId(tokenX, tokenY);
           const [sortedX, sortedY] = [tokenX, tokenY].sort();
-          pairScoresMap.set(`${sortedX}/${sortedY}`, { poolId, score: pairResult.pairScore });
+          pairScoresMap.set(`${sortedX}/${sortedY}`, {
+            poolId,
+            score: pairResult.pairScore,
+            tokenX: sortedX,
+            tokenY: sortedY,
+            tokenXScore: pairResult.tokenXScore,
+            tokenYScore: pairResult.tokenYScore
+          });
         }
       }
     }
@@ -92,10 +136,34 @@ async function processMerkleCheckpoint(): Promise<void> {
       return;
     }
 
-    const { root, epoch, poolCount } = await merkleBuilder.buildTree(pairScoresMap);
+    // Build merkle tree
+    const simplifiedMap = new Map(
+      Array.from(pairScoresMap.entries()).map(([key, value]) => [key, { poolId: value.poolId, score: value.score }])
+    );
+    const { root, epoch, poolCount } = await merkleBuilder.buildTree(simplifiedMap);
+
+    // Save all pair scores to database for this epoch
+    console.log(`[Scheduler] Saving ${pairScoresMap.size} pair scores to database...`);
+    let savedCount = 0;
+    for (const [_, pairData] of pairScoresMap) {
+      try {
+        await scoreSigner.signPairScore(
+          pairData.poolId,
+          pairData.score,
+          pairData.tokenX,
+          pairData.tokenY,
+          pairData.tokenXScore,
+          pairData.tokenYScore
+        );
+        savedCount++;
+      } catch (error) {
+        console.error(`[Scheduler] Error saving pair score ${pairData.tokenX}/${pairData.tokenY}:`, error);
+      }
+    }
+
     broadcastMerkleUpdate(root, epoch, poolCount);
 
-    console.log(`[Scheduler] Merkle checkpoint complete. Epoch=${epoch}, pairs=${poolCount}`);
+    console.log(`[Scheduler] Merkle checkpoint complete. Epoch=${epoch}, pairs=${poolCount}, saved=${savedCount}`);
   } catch (error) {
     console.error('[Scheduler] Merkle checkpoint failed:', error);
   }

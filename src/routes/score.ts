@@ -50,7 +50,7 @@ scoreRoutes.get('/tokens', async (c) => {
 
 /**
  * GET /api/score/tokens/leaderboard
- * Get top scoring tokens
+ * Get top scoring tokens (from memory - realtime)
  */
 scoreRoutes.get('/tokens/leaderboard', async (c) => {
   const limit = parseInt(c.req.query('limit') || '20');
@@ -73,6 +73,101 @@ scoreRoutes.get('/tokens/leaderboard', async (c) => {
     });
   } catch (error) {
     console.error('[ScoreRoute] Error fetching leaderboard:', error);
+    return c.json({ error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /api/score/tokens/:symbol/history
+ * Get historical token scores from database
+ */
+scoreRoutes.get('/tokens/:symbol/history', async (c) => {
+  const symbol = c.req.param('symbol').toUpperCase();
+  const limit = parseInt(c.req.query('limit') || '24');
+  const offset = parseInt(c.req.query('offset') || '0');
+
+  try {
+    const history = await db.query.tokenScores.findMany({
+      where: eq(schema.tokenScores.tokenSymbol, symbol),
+      orderBy: [desc(schema.tokenScores.createdAt)],
+      limit: Math.min(limit, 100),
+      offset,
+    });
+
+    if (history.length === 0) {
+      return c.json(
+        {
+          error: 'No history found for this token',
+          tokenSymbol: symbol,
+        },
+        404
+      );
+    }
+
+    return c.json({
+      tokenSymbol: symbol,
+      count: history.length,
+      history: history.map((s) => ({
+        score: s.score,
+        tier: scoreCalculator.getScoreTier(s.score),
+        rawPosts: s.rawPosts,
+        rawViews: s.rawViews,
+        rawLikes: s.rawLikes,
+        rawReposts: s.rawReposts,
+        rawReplies: s.rawReplies,
+        rawUniqueUsers: s.rawUniqueUsers,
+        avgBondingCurve: s.avgBondingCurve,
+        graduatedRatio: s.graduatedRatio,
+        imageRatio: s.imageRatio,
+        createdAt: s.createdAt,
+      })),
+    });
+  } catch (error) {
+    console.error('[ScoreRoute] Error fetching token history:', error);
+    return c.json({ error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /api/score/tokens/:symbol
+ * Get latest token score from database
+ */
+scoreRoutes.get('/tokens/:symbol', async (c) => {
+  const symbol = c.req.param('symbol').toUpperCase();
+
+  try {
+    const latestScore = await db.query.tokenScores.findFirst({
+      where: eq(schema.tokenScores.tokenSymbol, symbol),
+      orderBy: [desc(schema.tokenScores.createdAt)],
+    });
+
+    if (!latestScore) {
+      return c.json(
+        {
+          error: 'Score not found for this token',
+          tokenSymbol: symbol,
+        },
+        404
+      );
+    }
+
+    return c.json({
+      tokenSymbol: latestScore.tokenSymbol,
+      score: latestScore.score,
+      tier: scoreCalculator.getScoreTier(latestScore.score),
+      rawPosts: latestScore.rawPosts,
+      rawViews: latestScore.rawViews,
+      rawLikes: latestScore.rawLikes,
+      rawReposts: latestScore.rawReposts,
+      rawReplies: latestScore.rawReplies,
+      rawUniqueUsers: latestScore.rawUniqueUsers,
+      avgBondingCurve: latestScore.avgBondingCurve,
+      graduatedRatio: latestScore.graduatedRatio,
+      imageRatio: latestScore.imageRatio,
+      createdAt: latestScore.createdAt,
+    });
+  } catch (error) {
+    console.error('[ScoreRoute] Error fetching token score:', error);
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
