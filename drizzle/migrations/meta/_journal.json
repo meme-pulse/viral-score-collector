@@ -15,6 +15,13 @@
       "when": 1764684668302,
       "tag": "0001_unusual_jasper_sitwell",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1764855325882,
+      "tag": "0002_easy_gunslinger",
+      "breakpoints": true
     }
   ]
 }

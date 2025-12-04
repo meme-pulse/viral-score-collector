@@ -4,7 +4,7 @@ import { scoreCalculator } from '../services/score-calculator';
 import { epochSubmitter, type TokenRanking } from '../services/epoch-submitter';
 import { graphqlClient } from '../services/graphql-client';
 import { db, schema } from '../db/client';
-import { and, gte, lte } from 'drizzle-orm';
+import { and, gte, lte, eq } from 'drizzle-orm';
 import type { Address } from 'viem';
 import type { AggregatedMetrics } from '../types/memex';
 
@@ -14,6 +14,7 @@ import type { AggregatedMetrics } from '../types/memex';
 
 let scoreCollectionJob: CronJob | null = null;
 let epochSubmissionJob: CronJob | null = null;
+let epochCheckJob: CronJob | null = null; // Check for missing epochs periodically
 let cacheCleanupJob: CronJob | null = null;
 let hourlySnapshotJob: CronJob | null = null;
 let dailyAggregationJob: CronJob | null = null;
@@ -66,60 +67,114 @@ async function processScoreCollection(): Promise<void> {
 // EPOCH SUBMISSION (Every hour)
 // =============================================================================
 
-async function processEpochSubmission(): Promise<void> {
-  console.log('[Scheduler] Starting epoch submission...');
+/**
+ * Calculate epoch timestamp from epoch number
+ * EPOCH_DURATION = 1 hour (3600 seconds)
+ * Contract calculates: epoch = block.timestamp / EPOCH_DURATION
+ */
+function getEpochStartTimestamp(epoch: bigint): Date {
+  const EPOCH_DURATION_SECONDS = 3600; // 1 hour
+  const timestamp = Number(epoch) * EPOCH_DURATION_SECONDS;
+  return new Date(timestamp * 1000);
+}
+
+/**
+ * Get token scores for a specific epoch from snapshot
+ * Note: Snapshots are saved at :05, but epoch submission happens at :00
+ * For current epoch, we use the previous epoch's snapshot (most recent available)
+ * For past epochs, we use the epoch's own snapshot
+ */
+async function getEpochScores(
+  epoch: bigint
+): Promise<{ scores: Map<string, number>; fromSnapshot: boolean; snapshotHour: Date | null; note: string }> {
+  const epochStartTime = getEpochStartTimestamp(epoch);
+  const now = new Date();
+  const isCurrentEpoch = epochStartTime.getTime() <= now.getTime() && now.getTime() < epochStartTime.getTime() + 3600000;
+
+  // For current epoch, use previous epoch's snapshot (since current snapshot may not exist yet)
+  // For past epochs, use the epoch's own snapshot
+  let snapshotHour = new Date(epochStartTime);
+  snapshotHour.setMinutes(0, 0, 0);
+
+  if (isCurrentEpoch) {
+    // Use previous epoch's snapshot (1 hour before)
+    snapshotHour = new Date(snapshotHour.getTime() - 3600000);
+  }
 
   try {
-    if (!epochSubmitter.isReady()) {
-      console.log('[Scheduler] Epoch submitter not configured (missing SIGNER_PRIVATE_KEY)');
-      return;
-    }
-
-    const { canSubmit, currentEpoch, lastEpoch } = await epochSubmitter.canSubmitNewEpoch();
-    if (!canSubmit) {
-      console.log(`[Scheduler] Cannot submit new epoch. Current=${currentEpoch}, Last=${lastEpoch}`);
-      return;
-    }
-
-    if (latestTokenScores.size === 0) {
-      console.log('[Scheduler] No token scores available for epoch submission');
-      return;
-    }
-
-    // Build token rankings from GraphQL TVL data + viral scores
-    const rankings = await buildTokenRankings();
-
-    if (rankings.length === 0) {
-      console.log('[Scheduler] No token rankings available for submission');
-      return;
-    }
-
-    console.log(`[Scheduler] Top 3 token rankings:`);
-    rankings.slice(0, 3).forEach((r, i) => {
-      console.log(`  ${i + 1}. ${r.tokenAddress.slice(0, 10)}... score=${r.score}, binSteps=[${r.binSteps.join(',')}]`);
+    const snapshots = await db.query.tokenScoreSnapshots.findMany({
+      where: eq(schema.tokenScoreSnapshots.snapshotHour, snapshotHour),
     });
 
-    // Build viral pairs from top 3 rankings
-    const viralPairs = epochSubmitter.buildViralPairs(rankings.slice(0, 3));
+    if (snapshots.length === 0) {
+      const note = isCurrentEpoch
+        ? `Current epoch - snapshot not yet available (will be saved at :05), using latest scores`
+        : `No snapshot found for epoch ${epoch}`;
 
-    if (viralPairs.length === 0) {
-      console.log('[Scheduler] No viral pairs to submit');
-      return;
+      return {
+        scores: latestTokenScores,
+        fromSnapshot: false,
+        snapshotHour: null,
+        note,
+      };
     }
 
-    console.log(`[Scheduler] Submitting ${viralPairs.length} pairs for epoch ${currentEpoch}`);
+    const scoreMap = new Map<string, number>();
+    for (const snapshot of snapshots) {
+      scoreMap.set(snapshot.tokenSymbol.toUpperCase(), snapshot.score);
+    }
 
-    const result = await epochSubmitter.submitEpoch(currentEpoch, viralPairs);
-    console.log(`[Scheduler] Epoch ${result.epoch} submitted successfully! txHash=${result.txHash}`);
+    const note = isCurrentEpoch
+      ? `Using previous epoch's snapshot (epoch ${epoch - 1n}) as current epoch snapshot not yet available`
+      : `Using snapshot data from epoch ${epoch}`;
+
+    return {
+      scores: scoreMap,
+      fromSnapshot: true,
+      snapshotHour,
+      note,
+    };
   } catch (error) {
-    console.error('[Scheduler] Epoch submission failed:', error);
+    console.error(`[Scheduler] Failed to load snapshot for epoch ${epoch}:`, error);
+    return {
+      scores: latestTokenScores,
+      fromSnapshot: false,
+      snapshotHour: null,
+      note: `Error loading snapshot: ${error}`,
+    };
   }
 }
 
 /**
- * Build token rankings from GraphQL TVL data + viral scores
+ * Validate epoch data before submission
+ * Checks if snapshot exists and logs warnings if using current data
  */
-async function buildTokenRankings(): Promise<TokenRanking[]> {
+async function validateEpochData(epoch: bigint): Promise<{ valid: boolean; warnings: string[]; info: string[] }> {
+  const warnings: string[] = [];
+  const info: string[] = [];
+  const epochStartTime = getEpochStartTimestamp(epoch);
+  const now = new Date();
+  const isCurrentEpoch = epochStartTime.getTime() <= now.getTime() && now.getTime() < epochStartTime.getTime() + 3600000;
+
+  const { fromSnapshot, snapshotHour, note } = await getEpochScores(epoch);
+
+  if (fromSnapshot && snapshotHour) {
+    info.push(`✅ Using snapshot data from ${snapshotHour.toISOString()} for epoch ${epoch}`);
+    info.push(`   Note: ${note}`);
+  } else {
+    warnings.push(`⚠️  ${note}`);
+    warnings.push(`   Epoch start time: ${epochStartTime.toISOString()}`);
+    warnings.push(`   Using current scores - data may not accurately reflect epoch ${epoch}`);
+  }
+
+  return { valid: true, warnings, info };
+}
+
+/**
+ * Build token rankings from GraphQL TVL data + viral scores
+ * @param scoreMap Token scores map to use (from snapshot or current)
+ */
+async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenRanking[]> {
   try {
     const memeTokensWithPools = await graphqlClient.getMemeTokensWithPools();
 
@@ -131,7 +186,7 @@ async function buildTokenRankings(): Promise<TokenRanking[]> {
     const rankings: TokenRanking[] = [];
 
     for (const tokenData of memeTokensWithPools) {
-      const score = latestTokenScores.get(tokenData.tokenSymbol.toUpperCase()) ?? 0;
+      const score = scoreMap.get(tokenData.tokenSymbol.toUpperCase()) ?? 0;
 
       if (score <= 0) {
         continue;
@@ -161,6 +216,108 @@ async function buildTokenRankings(): Promise<TokenRanking[]> {
   } catch (error) {
     console.error('[Scheduler] Failed to build token rankings:', error);
     return [];
+  }
+}
+
+async function processEpochSubmission(): Promise<void> {
+  console.log('[Scheduler] Starting epoch submission...');
+
+  try {
+    if (!epochSubmitter.isReady()) {
+      console.log('[Scheduler] Epoch submitter not configured (missing SIGNER_PRIVATE_KEY)');
+      return;
+    }
+
+    const { canSubmit, currentEpoch, lastEpoch } = await epochSubmitter.canSubmitNewEpoch();
+    if (!canSubmit) {
+      console.log(`[Scheduler] Cannot submit new epoch. Current=${currentEpoch}, Last=${lastEpoch}`);
+      return;
+    }
+
+    // Validate epoch data
+    const validation = await validateEpochData(currentEpoch);
+
+    console.log(`[Scheduler] ===== Epoch ${currentEpoch} Data Validation =====`);
+    for (const info of validation.info) {
+      console.log(`[Scheduler] ${info}`);
+    }
+    for (const warning of validation.warnings) {
+      console.warn(`[Scheduler] ${warning}`);
+    }
+    console.log(`[Scheduler] ===============================================`);
+
+    // Get scores for this epoch
+    const { scores: epochScores, fromSnapshot, snapshotHour, note } = await getEpochScores(currentEpoch);
+
+    if (epochScores.size === 0) {
+      console.log('[Scheduler] No token scores available for epoch submission');
+      return;
+    }
+
+    console.log(`[Scheduler] Data source: ${fromSnapshot ? `Snapshot (${snapshotHour?.toISOString()})` : 'Current scores'}`);
+    console.log(`[Scheduler] Note: ${note}`);
+
+    // Build token rankings from GraphQL TVL data + viral scores
+    const rankings = await buildTokenRankings(epochScores);
+
+    if (rankings.length === 0) {
+      console.log('[Scheduler] No token rankings available for submission');
+      return;
+    }
+
+    console.log(`[Scheduler] Top 3 token rankings:`);
+    rankings.slice(0, 3).forEach((r, i) => {
+      console.log(`  ${i + 1}. ${r.tokenAddress.slice(0, 10)}... score=${r.score}, binSteps=[${r.binSteps.join(',')}]`);
+    });
+
+    // Build viral pairs from top 3 rankings
+    const viralPairs = epochSubmitter.buildViralPairs(rankings.slice(0, 3));
+
+    if (viralPairs.length === 0) {
+      console.log('[Scheduler] No viral pairs to submit');
+      return;
+    }
+
+    console.log(`[Scheduler] Submitting ${viralPairs.length} pairs for epoch ${currentEpoch}`);
+
+    const result = await epochSubmitter.submitEpoch(currentEpoch, viralPairs);
+    console.log(`[Scheduler] Epoch ${result.epoch} submitted successfully! txHash=${result.txHash}`);
+  } catch (error) {
+    console.error('[Scheduler] Epoch submission failed:', error);
+  }
+}
+
+// =============================================================================
+// EPOCH CHECK (Every 5 minutes - check for missing epochs and validate data)
+// =============================================================================
+
+async function processEpochCheck(): Promise<void> {
+  try {
+    if (!epochSubmitter.isReady()) {
+      return; // Skip if not configured
+    }
+
+    const { canSubmit, currentEpoch, lastEpoch } = await epochSubmitter.canSubmitNewEpoch();
+
+    if (canSubmit) {
+      const missingEpochs = Number(currentEpoch) - Number(lastEpoch);
+      if (missingEpochs > 0) {
+        console.log(`[Scheduler] ⚠️  Found ${missingEpochs} missing epoch(s). Current=${currentEpoch}, Last=${lastEpoch}`);
+
+        // Validate data availability for the current epoch
+        const validation = await validateEpochData(currentEpoch);
+        console.log(`[Scheduler] === Epoch Data Validation ===`);
+        for (const info of validation.info) {
+          console.log(`[Scheduler] ${info}`);
+        }
+        for (const warning of validation.warnings) {
+          console.warn(`[Scheduler] ${warning}`);
+        }
+        console.log(`[Scheduler] ============================`);
+      }
+    }
+  } catch (error) {
+    console.error('[Scheduler] Epoch check failed:', error);
   }
 }
 
@@ -401,6 +558,9 @@ export function startScheduler(): void {
   // Epoch submission - every hour at :00
   epochSubmissionJob = new CronJob('0 * * * *', processEpochSubmission, null, true, 'UTC');
 
+  // Epoch check - every 5 minutes (check for missing epochs and auto-submit)
+  epochCheckJob = new CronJob('*/5 * * * *', processEpochCheck, null, true, 'UTC');
+
   // Cache cleanup - every 5 minutes
   cacheCleanupJob = new CronJob('*/5 * * * *', processCacheCleanup, null, true, 'UTC');
 
@@ -422,16 +582,24 @@ export function startScheduler(): void {
   console.log('[Scheduler] Jobs started:');
   console.log('  - Score collection: every 10 seconds');
   console.log('  - Epoch submission: every hour at :00');
+  console.log('  - Epoch check: every 5 minutes (validate data availability)');
   console.log('  - Metrics refresh: every 5 minutes');
   console.log('  - Token image refresh: every 10 minutes');
   console.log('  - Hourly snapshot: every hour at :05');
   console.log('  - Daily aggregation: every day at 00:10 UTC');
+
+  // Check for missing epochs on startup
+  setTimeout(async () => {
+    console.log('[Scheduler] Checking epoch status on startup...');
+    await processEpochCheck();
+  }, 10000); // Wait 10 seconds for services to initialize
 }
 
 export function stopScheduler(): void {
   console.log('[Scheduler] Stopping jobs...');
   scoreCollectionJob?.stop();
   epochSubmissionJob?.stop();
+  epochCheckJob?.stop();
   cacheCleanupJob?.stop();
   metricsRefreshJob?.stop();
   tokenImageRefreshJob?.stop();
@@ -458,6 +626,7 @@ export function getSchedulerStatus() {
   return {
     scoreCollection: scoreCollectionJob?.running ?? false,
     epochSubmission: epochSubmissionJob?.running ?? false,
+    epochCheck: epochCheckJob?.running ?? false,
     metricsRefresh: metricsRefreshJob?.running ?? false,
     tokenImageRefresh: tokenImageRefreshJob?.running ?? false,
     cacheCleanup: cacheCleanupJob?.running ?? false,
@@ -493,6 +662,7 @@ export async function triggerEpochSubmission(): Promise<{
   message: string;
   txHash?: string;
   epoch?: string;
+  warnings?: string[];
 }> {
   try {
     if (!epochSubmitter.isReady()) {
@@ -504,8 +674,16 @@ export async function triggerEpochSubmission(): Promise<{
       return { status: 'skipped', message: `Cannot submit. Current=${currentEpoch}, Last=${lastEpoch}` };
     }
 
+    // Validate epoch data
+    const validation = await validateEpochData(currentEpoch);
+
     await processEpochSubmission();
-    return { status: 'success', message: 'Epoch submission triggered' };
+
+    return {
+      status: 'success',
+      message: 'Epoch submission triggered',
+      warnings: validation.warnings.length > 0 ? validation.warnings : undefined,
+    };
   } catch (error) {
     console.error('[Scheduler] Manual epoch submission failed:', error);
     return { status: 'error', message: String(error) };
