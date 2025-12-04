@@ -174,6 +174,44 @@ async function validateEpochData(epoch: bigint): Promise<{ valid: boolean; warni
  * Build token rankings from GraphQL TVL data + viral scores
  * @param scoreMap Token scores map to use (from snapshot or current)
  */
+/**
+ * Match a pool token with viral scores using symbol and name
+ * Returns the best matching score or 0 if no match
+ */
+function findTokenScore(
+  tokenData: { tokenSymbol: string; tokenName: string },
+  scoreMap: Map<string, number>
+): { score: number; matchedBy: string } {
+  const symbol = tokenData.tokenSymbol.toUpperCase();
+  const name = tokenData.tokenName.toUpperCase();
+
+  // Try symbol match first (exact)
+  const symbolScore = scoreMap.get(symbol);
+  if (symbolScore && symbolScore > 0) {
+    return { score: symbolScore, matchedBy: `symbol:${symbol}` };
+  }
+
+  // Try name match (exact)
+  const nameScore = scoreMap.get(name);
+  if (nameScore && nameScore > 0) {
+    return { score: nameScore, matchedBy: `name:${name}` };
+  }
+
+  // Try partial name match (e.g., "Memetern" matches "MEMETERN" in scores)
+  // Also check if any score key contains the name or vice versa
+  for (const [scoreKey, score] of scoreMap.entries()) {
+    if (score <= 0) continue;
+    const upperKey = scoreKey.toUpperCase();
+
+    // Check if score key matches token name (e.g., MEMETERN matches "Memetern")
+    if (upperKey === name || name.includes(upperKey) || upperKey.includes(name)) {
+      return { score, matchedBy: `name-partial:${scoreKey}→${name}` };
+    }
+  }
+
+  return { score: 0, matchedBy: 'none' };
+}
+
 async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenRanking[]> {
   try {
     const memeTokensWithPools = await graphqlClient.getMemeTokensWithPools();
@@ -185,8 +223,12 @@ async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenR
 
     const rankings: TokenRanking[] = [];
 
-    // Create a set of pool symbols for matching check
-    const poolSymbols = new Set(memeTokensWithPools.map((t) => t.tokenSymbol.toUpperCase()));
+    // Create sets for matching check (both symbol and name)
+    const poolIdentifiers = new Set<string>();
+    for (const t of memeTokensWithPools) {
+      poolIdentifiers.add(t.tokenSymbol.toUpperCase());
+      poolIdentifiers.add(t.tokenName.toUpperCase());
+    }
 
     // Check for top scored tokens that don't have pools
     const topScoredTokens = Array.from(scoreMap.entries())
@@ -195,7 +237,7 @@ async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenR
 
     const tokensWithoutPools: string[] = [];
     for (const [symbol, score] of topScoredTokens) {
-      if (!poolSymbols.has(symbol.toUpperCase()) && score > 0) {
+      if (!poolIdentifiers.has(symbol.toUpperCase()) && score > 0) {
         tokensWithoutPools.push(`${symbol}(${score})`);
       }
     }
@@ -206,7 +248,8 @@ async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenR
     }
 
     for (const tokenData of memeTokensWithPools) {
-      const score = scoreMap.get(tokenData.tokenSymbol.toUpperCase()) ?? 0;
+      // Try to match by symbol first, then by name
+      const { score, matchedBy } = findTokenScore(tokenData, scoreMap);
 
       if (score <= 0) {
         continue;
@@ -223,8 +266,10 @@ async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenR
       });
 
       console.log(
-        `[Scheduler] ${tokenData.tokenSymbol}: score=${score}, TVL=$${tokenData.totalTvlUSD.toFixed(2)}, ` +
-          `binSteps=[${tokenData.pools.map((p) => `${p.binStep}($${p.tvlUSD.toFixed(2)})`).join(', ')}]`
+        `[Scheduler] ${tokenData.tokenSymbol} (${tokenData.tokenName}): score=${score} [${matchedBy}], ` +
+          `TVL=$${tokenData.totalTvlUSD.toFixed(2)}, binSteps=[${tokenData.pools
+            .map((p) => `${p.binStep}($${p.tvlUSD.toFixed(2)})`)
+            .join(', ')}]`
       );
     }
 
@@ -237,7 +282,11 @@ async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenR
       console.log(`[Scheduler] Top 3 tokens for epoch submission:`);
       rankings.slice(0, 3).forEach((r, i) => {
         const tokenData = memeTokensWithPools.find((t) => t.tokenAddress.toLowerCase() === r.tokenAddress.toLowerCase());
-        console.log(`  ${i + 1}. ${tokenData?.tokenSymbol || 'Unknown'}: score=${r.score}, binSteps=[${r.binSteps.join(',')}]`);
+        console.log(
+          `  ${i + 1}. ${tokenData?.tokenSymbol || 'Unknown'} (${tokenData?.tokenName || '?'}): score=${
+            r.score
+          }, binSteps=[${r.binSteps.join(',')}]`
+        );
       });
     }
 

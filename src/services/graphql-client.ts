@@ -38,6 +38,7 @@ export interface LBPairData {
 export interface TokenPoolData {
   tokenAddress: Address;
   tokenSymbol: string;
+  tokenName: string; // Full token name for alternative matching
   quoteTokenAddress: Address;
   // binSteps sorted by TVL (highest first)
   pools: Array<{
@@ -217,6 +218,7 @@ export class GraphQLClient {
         tokenMap.set(memeAddr, {
           tokenAddress: normalizedTokenAddress,
           tokenSymbol: memeToken.symbol,
+          tokenName: memeToken.name, // Store token name for alternative matching
           quoteTokenAddress: normalizedQuoteAddress,
           pools: [
             {
