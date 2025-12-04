@@ -141,10 +141,14 @@ export class EpochSubmitter {
       const pairsToAdd = maxPairsPerRank[rankIdx];
 
       // Add pairs for each binStep (up to the limit for this rank)
+      // Normalize addresses to lowercase for consistency
+      const normalizedTokenX = ranking.tokenAddress.toLowerCase() as Address;
+      const normalizedTokenY = ranking.quoteTokenAddress.toLowerCase() as Address;
+
       for (let i = 0; i < Math.min(ranking.binSteps.length, pairsToAdd); i++) {
         pairs.push({
-          tokenX: ranking.tokenAddress,
-          tokenY: ranking.quoteTokenAddress,
+          tokenX: normalizedTokenX,
+          tokenY: normalizedTokenY,
           binStep: ranking.binSteps[i],
           rank,
         });

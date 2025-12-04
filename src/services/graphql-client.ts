@@ -201,23 +201,28 @@ export class GraphQLClient {
       const memeAddr = memeToken.address.toLowerCase();
       const existing = tokenMap.get(memeAddr);
 
+      // Normalize all addresses to lowercase for consistency
+      const normalizedTokenAddress = memeToken.address.toLowerCase() as Address;
+      const normalizedQuoteAddress = quoteToken.address.toLowerCase() as Address;
+      const normalizedPairAddress = pair.address.toLowerCase() as Address;
+
       if (existing) {
         existing.pools.push({
           binStep,
           tvlUSD: tvl,
-          pairAddress: pair.address as Address,
+          pairAddress: normalizedPairAddress,
         });
         existing.totalTvlUSD += tvl;
       } else {
         tokenMap.set(memeAddr, {
-          tokenAddress: memeToken.address as Address,
+          tokenAddress: normalizedTokenAddress,
           tokenSymbol: memeToken.symbol,
-          quoteTokenAddress: quoteToken.address as Address,
+          quoteTokenAddress: normalizedQuoteAddress,
           pools: [
             {
               binStep,
               tvlUSD: tvl,
-              pairAddress: pair.address as Address,
+              pairAddress: normalizedPairAddress,
             },
           ],
           totalTvlUSD: tvl,
@@ -265,8 +270,9 @@ export class GraphQLClient {
     const map = new Map<string, Address>();
 
     for (const pair of pairs) {
-      map.set(pair.tokenX.symbol.toUpperCase(), pair.tokenX.address as Address);
-      map.set(pair.tokenY.symbol.toUpperCase(), pair.tokenY.address as Address);
+      // Normalize addresses to lowercase for consistency
+      map.set(pair.tokenX.symbol.toUpperCase(), pair.tokenX.address.toLowerCase() as Address);
+      map.set(pair.tokenY.symbol.toUpperCase(), pair.tokenY.address.toLowerCase() as Address);
     }
 
     return map;

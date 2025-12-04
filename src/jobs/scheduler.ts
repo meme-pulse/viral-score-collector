@@ -185,6 +185,26 @@ async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenR
 
     const rankings: TokenRanking[] = [];
 
+    // Create a set of pool symbols for matching check
+    const poolSymbols = new Set(memeTokensWithPools.map((t) => t.tokenSymbol.toUpperCase()));
+
+    // Check for top scored tokens that don't have pools
+    const topScoredTokens = Array.from(scoreMap.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+
+    const tokensWithoutPools: string[] = [];
+    for (const [symbol, score] of topScoredTokens) {
+      if (!poolSymbols.has(symbol.toUpperCase()) && score > 0) {
+        tokensWithoutPools.push(`${symbol}(${score})`);
+      }
+    }
+
+    if (tokensWithoutPools.length > 0) {
+      console.warn(`[Scheduler] ⚠️  Top tokens WITHOUT pools: ${tokensWithoutPools.join(', ')}`);
+      console.warn(`[Scheduler]    These tokens have high scores but no LBPair with quote token`);
+    }
+
     for (const tokenData of memeTokensWithPools) {
       const score = scoreMap.get(tokenData.tokenSymbol.toUpperCase()) ?? 0;
 
@@ -210,7 +230,16 @@ async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenR
 
     // Sort by viral score (highest first)
     rankings.sort((a, b) => b.score - a.score);
-    console.log(`[Scheduler] Built ${rankings.length} token rankings`);
+    console.log(`[Scheduler] Built ${rankings.length} token rankings from ${memeTokensWithPools.length} pools`);
+
+    // Show which tokens will be submitted
+    if (rankings.length > 0) {
+      console.log(`[Scheduler] Top 3 tokens for epoch submission:`);
+      rankings.slice(0, 3).forEach((r, i) => {
+        const tokenData = memeTokensWithPools.find((t) => t.tokenAddress.toLowerCase() === r.tokenAddress.toLowerCase());
+        console.log(`  ${i + 1}. ${tokenData?.tokenSymbol || 'Unknown'}: score=${r.score}, binSteps=[${r.binSteps.join(',')}]`);
+      });
+    }
 
     return rankings;
   } catch (error) {
@@ -220,21 +249,31 @@ async function buildTokenRankings(scoreMap: Map<string, number>): Promise<TokenR
 }
 
 async function processEpochSubmission(): Promise<void> {
+  console.log('[Scheduler] ========================================');
   console.log('[Scheduler] Starting epoch submission...');
+  console.log('[Scheduler] ========================================');
 
   try {
+    console.log(`[Scheduler] Step 1: Checking epoch submitter readiness...`);
     if (!epochSubmitter.isReady()) {
-      console.log('[Scheduler] Epoch submitter not configured (missing SIGNER_PRIVATE_KEY)');
+      console.error('[Scheduler] ❌ Epoch submitter not configured (missing SIGNER_PRIVATE_KEY)');
+      console.error('[Scheduler] Please set SIGNER_PRIVATE_KEY environment variable');
       return;
     }
+    console.log(`[Scheduler] ✅ Epoch submitter ready. Signer: ${epochSubmitter.getSignerAddress()}`);
 
+    console.log(`[Scheduler] Step 2: Checking if epoch can be submitted...`);
     const { canSubmit, currentEpoch, lastEpoch } = await epochSubmitter.canSubmitNewEpoch();
+    console.log(`[Scheduler] Current epoch: ${currentEpoch}, Last epoch: ${lastEpoch}, Can submit: ${canSubmit}`);
+
     if (!canSubmit) {
-      console.log(`[Scheduler] Cannot submit new epoch. Current=${currentEpoch}, Last=${lastEpoch}`);
+      console.warn(`[Scheduler] ⚠️  Cannot submit new epoch. Current=${currentEpoch}, Last=${lastEpoch}`);
+      console.warn(`[Scheduler] This means currentEpoch <= lastEpoch (epoch already submitted or invalid)`);
       return;
     }
+    console.log(`[Scheduler] ✅ Can submit epoch ${currentEpoch}`);
 
-    // Validate epoch data
+    console.log(`[Scheduler] Step 3: Validating epoch data...`);
     const validation = await validateEpochData(currentEpoch);
 
     console.log(`[Scheduler] ===== Epoch ${currentEpoch} Data Validation =====`);
@@ -246,44 +285,69 @@ async function processEpochSubmission(): Promise<void> {
     }
     console.log(`[Scheduler] ===============================================`);
 
-    // Get scores for this epoch
+    console.log(`[Scheduler] Step 4: Getting token scores for epoch...`);
     const { scores: epochScores, fromSnapshot, snapshotHour, note } = await getEpochScores(currentEpoch);
 
     if (epochScores.size === 0) {
-      console.log('[Scheduler] No token scores available for epoch submission');
+      console.error('[Scheduler] ❌ No token scores available for epoch submission');
+      console.error(`[Scheduler] Latest token scores count: ${latestTokenScores.size}`);
       return;
     }
-
+    console.log(`[Scheduler] ✅ Found ${epochScores.size} token scores`);
     console.log(`[Scheduler] Data source: ${fromSnapshot ? `Snapshot (${snapshotHour?.toISOString()})` : 'Current scores'}`);
     console.log(`[Scheduler] Note: ${note}`);
 
-    // Build token rankings from GraphQL TVL data + viral scores
+    console.log(`[Scheduler] Step 5: Building token rankings from GraphQL TVL data...`);
     const rankings = await buildTokenRankings(epochScores);
 
     if (rankings.length === 0) {
-      console.log('[Scheduler] No token rankings available for submission');
+      console.error('[Scheduler] ❌ No token rankings available for submission');
+      console.error(`[Scheduler] This could mean:`);
+      console.error(`[Scheduler]   - No meme tokens found in GraphQL`);
+      console.error(`[Scheduler]   - No tokens with positive scores`);
+      console.error(`[Scheduler]   - GraphQL query failed`);
       return;
     }
+    console.log(`[Scheduler] ✅ Built ${rankings.length} token rankings`);
 
-    console.log(`[Scheduler] Top 3 token rankings:`);
+    console.log(`[Scheduler] Step 6: Top 3 token rankings:`);
     rankings.slice(0, 3).forEach((r, i) => {
       console.log(`  ${i + 1}. ${r.tokenAddress.slice(0, 10)}... score=${r.score}, binSteps=[${r.binSteps.join(',')}]`);
     });
 
-    // Build viral pairs from top 3 rankings
+    console.log(`[Scheduler] Step 7: Building viral pairs from top 3 rankings...`);
     const viralPairs = epochSubmitter.buildViralPairs(rankings.slice(0, 3));
 
     if (viralPairs.length === 0) {
-      console.log('[Scheduler] No viral pairs to submit');
+      console.error('[Scheduler] ❌ No viral pairs to submit');
+      console.error(`[Scheduler] This should not happen if we have rankings. Check buildViralPairs logic.`);
       return;
     }
+    console.log(`[Scheduler] ✅ Built ${viralPairs.length} viral pairs`);
 
+    console.log(`[Scheduler] Step 8: Submitting epoch to contract...`);
     console.log(`[Scheduler] Submitting ${viralPairs.length} pairs for epoch ${currentEpoch}`);
+    console.log(
+      `[Scheduler] Pairs:`,
+      viralPairs.map((p) => ({
+        tokenX: p.tokenX.slice(0, 10) + '...',
+        tokenY: p.tokenY.slice(0, 10) + '...',
+        binStep: p.binStep,
+        rank: p.rank,
+      }))
+    );
 
     const result = await epochSubmitter.submitEpoch(currentEpoch, viralPairs);
-    console.log(`[Scheduler] Epoch ${result.epoch} submitted successfully! txHash=${result.txHash}`);
+    console.log(`[Scheduler] ========================================`);
+    console.log(`[Scheduler] ✅ Epoch ${result.epoch} submitted successfully!`);
+    console.log(`[Scheduler] Transaction hash: ${result.txHash}`);
+    console.log(`[Scheduler] Pairs count: ${result.pairsCount}`);
+    console.log(`[Scheduler] ========================================`);
   } catch (error) {
-    console.error('[Scheduler] Epoch submission failed:', error);
+    console.error('[Scheduler] ========================================');
+    console.error('[Scheduler] ❌ Epoch submission failed:', error);
+    console.error('[Scheduler] Error details:', error instanceof Error ? error.stack : String(error));
+    console.error('[Scheduler] ========================================');
   }
 }
 
@@ -293,16 +357,39 @@ async function processEpochSubmission(): Promise<void> {
 
 async function processEpochCheck(): Promise<void> {
   try {
+    console.log('[Scheduler] === Epoch Check Debug ===');
+    console.log(`[Scheduler] Epoch submitter ready: ${epochSubmitter.isReady()}`);
+    console.log(`[Scheduler] Signer address: ${epochSubmitter.getSignerAddress() || 'NOT SET'}`);
+
     if (!epochSubmitter.isReady()) {
+      console.warn('[Scheduler] ⚠️  Epoch submitter not ready - SIGNER_PRIVATE_KEY may be missing');
       return; // Skip if not configured
     }
 
     const { canSubmit, currentEpoch, lastEpoch } = await epochSubmitter.canSubmitNewEpoch();
+    console.log(`[Scheduler] Current epoch: ${currentEpoch}, Last epoch: ${lastEpoch}, Can submit: ${canSubmit}`);
 
     if (canSubmit) {
       const missingEpochs = Number(currentEpoch) - Number(lastEpoch);
       if (missingEpochs > 0) {
         console.log(`[Scheduler] ⚠️  Found ${missingEpochs} missing epoch(s). Current=${currentEpoch}, Last=${lastEpoch}`);
+
+        // Check why submission might be failing
+        console.log(`[Scheduler] Checking submission prerequisites...`);
+        console.log(`[Scheduler] - Token scores count: ${latestTokenScores.size}`);
+
+        if (latestTokenScores.size === 0) {
+          console.warn(`[Scheduler] ⚠️  No token scores available - epoch submission will fail`);
+        } else {
+          console.log(`[Scheduler] ✅ Token scores available: ${latestTokenScores.size} tokens`);
+          // Show top 3 scores
+          const topScores = Array.from(latestTokenScores.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 3);
+          topScores.forEach(([symbol, score], i) => {
+            console.log(`[Scheduler]   ${i + 1}. ${symbol}: ${score}`);
+          });
+        }
 
         // Validate data availability for the current epoch
         const validation = await validateEpochData(currentEpoch);
@@ -314,8 +401,28 @@ async function processEpochCheck(): Promise<void> {
           console.warn(`[Scheduler] ${warning}`);
         }
         console.log(`[Scheduler] ============================`);
+
+        // If we have token scores and can submit, try to submit the current epoch
+        // This helps catch up if the scheduled submission missed
+        if (latestTokenScores.size > 0 && missingEpochs === 1) {
+          console.log(`[Scheduler] Attempting to submit current epoch ${currentEpoch}...`);
+          try {
+            await processEpochSubmission();
+          } catch (error) {
+            console.error(`[Scheduler] Failed to submit epoch during check:`, error);
+          }
+        } else if (missingEpochs > 1) {
+          console.warn(
+            `[Scheduler] ⚠️  Multiple epochs missing (${missingEpochs}). Manual submission recommended via POST /api/score/epoch/submit`
+          );
+        }
+      } else {
+        console.log(`[Scheduler] ✅ All epochs up to date`);
       }
+    } else {
+      console.log(`[Scheduler] Cannot submit: Current=${currentEpoch}, Last=${lastEpoch} (currentEpoch <= lastEpoch)`);
     }
+    console.log('[Scheduler] === End Epoch Check ===');
   } catch (error) {
     console.error('[Scheduler] Epoch check failed:', error);
   }

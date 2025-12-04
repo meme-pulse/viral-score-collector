@@ -1,7 +1,14 @@
 import { Hono } from 'hono';
 import { scoreCalculator } from '../services/score-calculator';
 import { memexCollector } from '../services/memex-collector';
-import { getLatestTokenScores, triggerBackfill, getSchedulerStatus, triggerTokenImageRefresh, triggerEpochSubmission, getEpochStatus } from '../jobs/scheduler';
+import {
+  getLatestTokenScores,
+  triggerBackfill,
+  getSchedulerStatus,
+  triggerTokenImageRefresh,
+  triggerEpochSubmission,
+  getEpochStatus,
+} from '../jobs/scheduler';
 import { isBlacklisted } from '../constants/token-blacklist';
 
 export const scoreRoutes = new Hono();
@@ -108,7 +115,7 @@ scoreRoutes.get('/epoch/status', async (c) => {
  * POST /api/score/epoch/submit
  * Manually trigger epoch submission to ViralScoreReporter contract
  */
-scoreRoutes.post('/epoch/submit', async (c) => {
+scoreRoutes.get('/epoch/submit', async (c) => {
   try {
     const result = await triggerEpochSubmission();
     return c.json(result);
@@ -129,7 +136,7 @@ scoreRoutes.post('/epoch/submit', async (c) => {
 scoreRoutes.get('/images/status', async (c) => {
   try {
     const cacheStatus = memexCollector.getTokenImageCacheStatus();
-    
+
     return c.json({
       cacheCount: cacheStatus.count,
       cacheUpdatedAt: cacheStatus.updatedAt?.toISOString() ?? null,
@@ -148,7 +155,7 @@ scoreRoutes.post('/images/refresh', async (c) => {
   try {
     const result = await triggerTokenImageRefresh();
     const cacheStatus = memexCollector.getTokenImageCacheStatus();
-    
+
     return c.json({
       ...result,
       cacheCount: cacheStatus.count,
@@ -166,14 +173,14 @@ scoreRoutes.post('/images/refresh', async (c) => {
  */
 scoreRoutes.get('/images/:tokenSymbol', async (c) => {
   const tokenSymbol = c.req.param('tokenSymbol').toUpperCase();
-  
+
   try {
     const imageInfo = memexCollector.getTokenImageInfo(tokenSymbol);
-    
+
     if (!imageInfo) {
       return c.json({ error: 'Token image not found', tokenSymbol }, 404);
     }
-    
+
     return c.json({
       tokenSymbol: imageInfo.tokenSymbol,
       tokenName: imageInfo.tokenName,
