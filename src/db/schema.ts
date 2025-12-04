@@ -31,7 +31,7 @@ export const tokenScores = pgTable(
 
 /**
  * Pair Pools table - Tracks registered LB DEX pair pools
- * Pool ID is derived from sorted tokenX + tokenY (no binStep)
+ * Pool ID is derived from sorted tokenX + tokenY + binStep
  */
 export const pairPools = pgTable(
   'pair_pools',
@@ -40,14 +40,16 @@ export const pairPools = pgTable(
     poolId: varchar('pool_id', { length: 66 }).notNull().unique(),
     tokenXSymbol: varchar('token_x_symbol', { length: 32 }).notNull(),
     tokenYSymbol: varchar('token_y_symbol', { length: 32 }).notNull(),
-    tokenXAddress: varchar('token_x_address', { length: 42 }),
-    tokenYAddress: varchar('token_y_address', { length: 42 }),
+    tokenXAddress: varchar('token_x_address', { length: 42 }).notNull(),
+    tokenYAddress: varchar('token_y_address', { length: 42 }).notNull(),
+    binStep: integer('bin_step').notNull().default(100), // LB DEX bin step
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
   },
   (table) => ({
     poolIdIdx: uniqueIndex('pair_pool_id_idx').on(table.poolId),
     tokenPairIdx: index('pair_tokens_idx').on(table.tokenXSymbol, table.tokenYSymbol),
+    tokenAddressIdx: index('pair_token_addresses_idx').on(table.tokenXAddress, table.tokenYAddress),
   })
 );
 
@@ -102,6 +104,62 @@ export const merkleCheckpoints = pgTable(
 );
 
 /**
+ * Token Score Snapshots table - Hourly snapshots of token scores
+ * Used for historical analysis and trend tracking
+ */
+export const tokenScoreSnapshots = pgTable(
+  'token_score_snapshots',
+  {
+    id: serial('id').primaryKey(),
+    tokenSymbol: varchar('token_symbol', { length: 32 }).notNull(),
+    score: integer('score').notNull(), // 0-10000 basis points
+    snapshotHour: timestamp('snapshot_hour').notNull(), // Rounded to hour
+    // Raw metrics for debugging/auditing
+    rawPosts: integer('raw_posts').default(0),
+    rawViews: integer('raw_views').default(0),
+    rawLikes: integer('raw_likes').default(0),
+    rawReposts: integer('raw_reposts').default(0),
+    rawReplies: integer('raw_replies').default(0),
+    rawUniqueUsers: integer('raw_unique_users').default(0),
+    // Enhanced metrics
+    avgBondingCurve: real('avg_bonding_curve').default(0),
+    graduatedRatio: real('graduated_ratio').default(0),
+    imageRatio: real('image_ratio').default(0),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => ({
+    tokenHourIdx: uniqueIndex('token_score_snapshots_token_hour_idx').on(table.tokenSymbol, table.snapshotHour),
+    snapshotHourIdx: index('token_score_snapshots_hour_idx').on(table.snapshotHour),
+  })
+);
+
+/**
+ * Token Score Daily table - Daily aggregated scores
+ * Used for long-term trend analysis
+ */
+export const tokenScoreDaily = pgTable(
+  'token_score_daily',
+  {
+    id: serial('id').primaryKey(),
+    tokenSymbol: varchar('token_symbol', { length: 32 }).notNull(),
+    avgScore: integer('avg_score').notNull(), // Average score for the day
+    maxScore: integer('max_score').notNull(), // Max score for the day
+    minScore: integer('min_score').notNull(), // Min score for the day
+    snapshotDate: timestamp('snapshot_date').notNull(), // Date (midnight)
+    // Daily aggregated metrics
+    totalPosts: integer('total_posts').default(0),
+    totalViews: integer('total_views').default(0),
+    totalLikes: integer('total_likes').default(0),
+    totalReposts: integer('total_reposts').default(0),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => ({
+    tokenDateIdx: uniqueIndex('token_score_daily_token_date_idx').on(table.tokenSymbol, table.snapshotDate),
+    snapshotDateIdx: index('token_score_daily_date_idx').on(table.snapshotDate),
+  })
+);
+
+/**
  * Memex Posts table - Cache of processed Memex posts
  */
 export const memexPosts = pgTable(
@@ -139,6 +197,10 @@ export const memexPosts = pgTable(
 // Type exports for Drizzle
 export type TokenScore = typeof tokenScores.$inferSelect;
 export type NewTokenScore = typeof tokenScores.$inferInsert;
+export type TokenScoreSnapshot = typeof tokenScoreSnapshots.$inferSelect;
+export type NewTokenScoreSnapshot = typeof tokenScoreSnapshots.$inferInsert;
+export type TokenScoreDaily = typeof tokenScoreDaily.$inferSelect;
+export type NewTokenScoreDaily = typeof tokenScoreDaily.$inferInsert;
 export type PairPool = typeof pairPools.$inferSelect;
 export type NewPairPool = typeof pairPools.$inferInsert;
 export type PairScore = typeof pairScores.$inferSelect;
@@ -147,3 +209,5 @@ export type MerkleCheckpoint = typeof merkleCheckpoints.$inferSelect;
 export type NewMerkleCheckpoint = typeof merkleCheckpoints.$inferInsert;
 export type MemexPost = typeof memexPosts.$inferSelect;
 export type NewMemexPost = typeof memexPosts.$inferInsert;
+
+

@@ -1,208 +1,236 @@
-# Viral Score Server
+# Viral Score Server v2.0
 
-소셜 미디어 바이럴 데이터를 수집하고 DeFi 풀의 프로토콜 수수료 할인에 활용하는 서버입니다.
+Memex 소셜 데이터 기반 밈토큰 viral score 계산 및 온체인 제출 서버
 
-## 기능
+## 🏗️ 아키텍처
 
-- **Memex API 데이터 수집**: 소셜 미디어 engagement 데이터 실시간 수집
-- **Viral Score 계산**: 가중치 기반 점수 계산 및 time decay 적용
-- **서명된 점수 제공**: viem ECDSA 서명으로 온체인 검증 가능
-- **Merkle Tree**: 배치 검증을 위한 주기적 Merkle checkpoint
-- **실시간 WebSocket**: 점수 업데이트 실시간 스트리밍
-
-## 기술 스택
-
-- **Runtime**: Bun
-- **Framework**: Hono
-- **Database**: PostgreSQL (Drizzle ORM)
-- **Signing**: viem
-- **Merkle**: @openzeppelin/merkle-tree
-
-## 설치
-
-```bash
-# Bun 설치 (없는 경우)
-curl -fsSL https://bun.sh/install | bash
-
-# 의존성 설치
-bun install
-
-# 환경변수 설정
-cp env.template .env
-# .env 파일 수정
-
-# 데이터베이스 마이그레이션
-bun run db:generate
-bun run db:migrate
-
-# 서버 실행
-bun run dev
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     VIRAL SCORE SERVER                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌───────────────┐     ┌────────────────┐                      │
+│  │   Memex API   │────▶│  Score Calc    │──────┐               │
+│  │   (Social)    │     │  (0-10000)     │      │               │
+│  └───────────────┘     └────────────────┘      │               │
+│                                                │               │
+│  ┌───────────────┐     ┌────────────────┐      ▼               │
+│  │   GraphQL     │────▶│  TVL Sorting   │──▶ Rankings          │
+│  │   (Envio)     │     │                │                      │
+│  └───────────────┘     └────────────────┘      │               │
+│                                                │               │
+│                                                ▼               │
+│                              ┌────────────────────────────┐    │
+│                              │     Epoch Submitter        │    │
+│                              │  - ECDSA Signing           │    │
+│                              │  - Contract Submission     │    │
+│                              └─────────────┬──────────────┘    │
+│                                            │                   │
+└────────────────────────────────────────────┼───────────────────┘
+                                             │
+                                             ▼
+                              ┌────────────────────────────┐
+                              │   ViralScoreReporter       │
+                              │   (On-chain Contract)      │
+                              └────────────────────────────┘
 ```
 
-## 환경변수
+## 📁 프로젝트 구조
+
+```
+viral-score-server/
+├── src/
+│   ├── index.ts                    # 서버 진입점
+│   ├── constants/
+│   │   ├── token-blacklist.ts      # 제외 토큰 목록
+│   │   └── viral-score-reporter-abi.ts  # 컨트랙트 ABI
+│   ├── db/
+│   │   ├── client.ts               # DB 클라이언트
+│   │   ├── schema.ts               # 스키마 정의
+│   │   └── migrate.ts              # 마이그레이션
+│   ├── jobs/
+│   │   └── scheduler.ts            # 스케줄러
+│   ├── routes/
+│   │   └── score.ts                # API 라우트
+│   ├── services/
+│   │   ├── memex-collector.ts      # Memex 데이터 수집
+│   │   ├── score-calculator.ts     # 점수 계산
+│   │   ├── graphql-client.ts       # TVL 조회
+│   │   └── epoch-submitter.ts      # 온체인 제출
+│   └── types/
+│       ├── memex.ts
+│       └── score.ts
+├── drizzle/
+├── env.template
+└── package.json
+```
+
+## ⚙️ 환경변수
 
 ```env
 # Database
 DATABASE_URL=postgresql://user:password@localhost:5432/viral_score
-
-# Signer (프로덕션용 새 키 생성 필요)
-SIGNER_PRIVATE_KEY=0x...
 
 # Memex API
 MEMEX_API_BASE=https://app.memex.xyz/api/service/public
 
 # Server
 PORT=3001
+
+# On-chain (ViralScoreReporter)
+SIGNER_PRIVATE_KEY=0x...        # trustedSigner 개인키 (필수)
+VIRAL_SCORE_REPORTER_ADDRESS=0x639323a363Da20E755c3D38C14d59FbCC67446bC
+CHAIN_ID=43522
+
+# GraphQL (Envio Indexer - TVL 조회)
+GRAPHQL_ENDPOINT=https://indexer.dev.hyperindex.xyz/e3c58e2/v1/graphql
+QUOTE_TOKEN_ADDRESS=0x653e645e3d81a72e71328Bc01A04002945E3ef7A  # WM
 ```
 
-## API 엔드포인트
+## 🔄 스케줄러
 
-### Score API
+| 작업 | 주기 | 설명 |
+|------|------|------|
+| Score Collection | 10초 | Memex 데이터 수집 & 점수 계산 |
+| **Epoch Submission** | 매시 :00 | Top 3 토큰 온체인 제출 |
+| Metrics Refresh | 5분 | 최근 포스트 메트릭 갱신 |
+| Token Image Refresh | 10분 | 토큰 이미지 캐시 |
+| Hourly Snapshot | 매시 :05 | DB 스냅샷 저장 |
+| Daily Aggregation | 00:10 UTC | 일별 집계 |
 
-| Method | Endpoint                     | Description                |
-| ------ | ---------------------------- | -------------------------- |
-| GET    | `/api/score/:poolId`         | 풀의 최신 서명된 점수 조회 |
-| GET    | `/api/score/:poolId/history` | 풀의 점수 히스토리 조회    |
-| GET    | `/api/score/token/:symbol`   | 토큰 심볼로 점수 조회      |
-| GET    | `/api/score/leaderboard`     | 점수 순위표                |
-| POST   | `/api/score/register`        | 새 토큰 등록               |
-| GET    | `/api/score/signer`          | 서명자 주소 조회           |
+## 🏆 Epoch 제출 로직
 
-### Merkle API
-
-| Method | Endpoint                        | Description             |
-| ------ | ------------------------------- | ----------------------- |
-| GET    | `/api/merkle/root`              | 현재 Merkle root 조회   |
-| GET    | `/api/merkle/proof/:poolId`     | 풀의 Merkle proof 조회  |
-| POST   | `/api/merkle/verify`            | Merkle proof 검증       |
-| GET    | `/api/merkle/checkpoints`       | Checkpoint 목록         |
-| GET    | `/api/merkle/checkpoint/:epoch` | 특정 epoch의 checkpoint |
-
-### WebSocket
-
-```javascript
-// 연결
-const ws = new WebSocket('ws://localhost:3001/ws');
-
-// 특정 풀 구독
-ws.send(
-  JSON.stringify({
-    type: 'subscribe',
-    poolIds: ['0x1234...', '0x5678...'],
-  })
-);
-
-// 모든 업데이트 구독
-ws.send(
-  JSON.stringify({
-    type: 'subscribeAll',
-  })
-);
-
-// 점수 업데이트 수신
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  if (data.type === 'scoreUpdate') {
-    console.log('New score:', data.data);
-  }
-};
-```
-
-## 점수 계산 로직
+### 1. Token Ranking (GraphQL + Viral Score)
 
 ```
-rawScore = posts × 100 + views × 1 + likes × 20 + reposts × 50 + replies × 30 + uniqueUsers × 200
-
-timeDecay = e^(-ageHours × ln(2) / 24)  // 24시간 반감기
-
-finalScore = normalize(rawScore × timeDecay × antiGamingFactor)  // 0-10000
+1. GraphQL에서 LBPair TVL 조회
+2. Quote 토큰(WM)과 페어된 밈토큰 그룹화
+3. 각 토큰의 binStep을 TVL 순으로 정렬
+4. Memex viral score로 토큰 순위 결정
 ```
 
-### Score Tiers
+### 2. ViralPair 구성
 
-| Score     | Tier      |
-| --------- | --------- |
-| 8000+     | LEGENDARY |
-| 6000-7999 | VIRAL     |
-| 4000-5999 | HOT       |
-| 2000-3999 | WARM      |
-| 500-1999  | ACTIVE    |
-| 0-499     | COLD      |
+```
+Top 3 토큰 선정:
+- Rank 1: TVL 상위 3개 binStep (protocol share 10%)
+- Rank 2: TVL 상위 2개 binStep (protocol share 20%)
+- Rank 3: TVL 상위 1개 binStep (protocol share 40%)
+```
 
-## 온체인 통합
+### 3. 서명 & 제출
 
-### 서명 검증 (Solidity)
+```typescript
+// EIP-191 서명
+messageHash = keccak256(abi.encode(epoch, pairs))
+signature = signer.signMessage({ message: { raw: messageHash } })
 
-```solidity
-function verifyScore(
-    bytes32 poolId,
-    uint256 score,
-    uint256 timestamp,
-    uint256 nonce,
-    bytes calldata signature
-) external view returns (bool) {
-    bytes32 messageHash = keccak256(abi.encodePacked(poolId, score, timestamp, nonce));
-    bytes32 ethHash = messageHash.toEthSignedMessageHash();
-    return ethHash.recover(signature) == trustedSigner;
+// 컨트랙트 호출
+reporter.submitEpoch(epoch, pairs, signature)
+```
+
+## 🌐 API
+
+### Token Scores
+
+| Method | Path | 설명 |
+|--------|------|------|
+| GET | `/api/score/tokens` | 모든 토큰 점수 |
+| GET | `/api/score/tokens/leaderboard` | 리더보드 (rank, score, stats) |
+
+### Epoch (On-chain)
+
+| Method | Path | 설명 |
+|--------|------|------|
+| GET | `/api/score/epoch/status` | Epoch 상태 |
+| POST | `/api/score/epoch/submit` | 수동 제출 |
+
+### Token Images
+
+| Method | Path | 설명 |
+|--------|------|------|
+| GET | `/api/score/images/status` | 캐시 상태 |
+| GET | `/api/score/images/:symbol` | 토큰 이미지 |
+| POST | `/api/score/images/refresh` | 캐시 갱신 |
+
+### Backfill
+
+| Method | Path | 설명 |
+|--------|------|------|
+| GET | `/api/score/backfill/status` | Backfill 상태 |
+| POST | `/api/score/backfill` | Backfill 실행 |
+
+### Health
+
+| Method | Path | 설명 |
+|--------|------|------|
+| GET | `/` | 서버 정보 |
+| GET | `/health` | 상세 상태 |
+
+## 📡 응답 예시
+
+### GET `/api/score/tokens/leaderboard`
+
+```json
+{
+  "count": 20,
+  "updatedAt": "2024-12-04T10:00:00.000Z",
+  "leaderboard": [
+    {
+      "rank": 1,
+      "tokenSymbol": "PEPE",
+      "imageSrc": "https://...",
+      "tokenName": "Pepe Coin",
+      "posts": { "1h": 15, "1d": 120, "7d": 850 },
+      "views": { "1h": 5000, "1d": 45000, "7d": 320000 },
+      "likes": { "1h": 200, "1d": 1800, "7d": 12000 },
+      "pulseScore": 85
+    }
+  ]
 }
 ```
 
-### Protocol Share 계산
+### GET `/api/score/epoch/status`
 
-```solidity
-// 최대 50% 할인 (score 10000일 때)
-uint256 reductionBps = (score * 5000) / 10000;
-uint256 adjustedShare = baseShare * (10000 - reductionBps) / 10000;
+```json
+{
+  "ready": true,
+  "signerAddress": "0x1066...",
+  "currentEpoch": "482156",
+  "lastEpoch": "482155",
+  "canSubmit": true,
+  "activePairs": 6
+}
 ```
 
-## 개발
+## 🚀 실행
 
 ```bash
-# 개발 모드 (watch)
+# 설치
+bun install
+
+# 개발
 bun run dev
 
-# 프로덕션 실행
+# 프로덕션
 bun run start
-
-# DB 스키마 생성
-bun run db:generate
-
-# DB 마이그레이션
-bun run db:migrate
-
-# Drizzle Studio (DB 관리)
-bun run db:studio
 ```
 
-## 아키텍처
+## 🔗 연동 컨트랙트
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         VIRAL SCORE SERVER                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐       │
-│   │   Memex     │     │   Score     │     │   Signer    │       │
-│   │  Collector  │────▶│ Calculator  │────▶│  Service    │       │
-│   └─────────────┘     └─────────────┘     └──────┬──────┘       │
-│                                                   │              │
-│                                                   ▼              │
-│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐       │
-│   │  Scheduler  │     │   Merkle    │     │  PostgreSQL │       │
-│   │   (Cron)    │────▶│  Builder    │────▶│    (DB)     │       │
-│   └─────────────┘     └─────────────┘     └─────────────┘       │
-│                                                   │              │
-│                                                   ▼              │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                    Hono HTTP Server                     │   │
-│   │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │   │
-│   │  │  Score API   │  │  Merkle API  │  │  WebSocket   │   │   │
-│   │  └──────────────┘  └──────────────┘  └──────────────┘   │   │
-│   └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+| 항목 | 값 |
+|------|-----|
+| Contract | `ViralScoreReporter` |
+| Address | `0x639323a363Da20E755c3D38C14d59FbCC67446bC` |
+| Network | Memecore Testnet (43522) |
+| Epoch Duration | 1 hour |
+| Max Pairs | 6 (3+2+1) |
 
-## License
+## 📊 Protocol Share 감소
 
-MIT
+| Rank | Protocol Share | 설명 |
+|------|----------------|------|
+| 1 | 10% | Top viral (3 binSteps) |
+| 2 | 20% | 2nd viral (2 binSteps) |
+| 3 | 40% | 3rd viral (1 binStep) |
+| Default | 50% | 일반 페어 |

@@ -96,8 +96,68 @@ export interface AggregatedMetrics {
  * Token extraction result with source tracking
  */
 export interface ExtractedTokens {
-  mentions: string[];    // @username mentions
-  tickers: string[];     // $TICKER patterns
-  hashtags: string[];    // #hashtag patterns
-  all: string[];         // Combined unique tokens
+  mentions: string[]; // @username mentions
+  tickers: string[]; // $TICKER patterns
+  hashtags: string[]; // #hashtag patterns
+  all: string[]; // Combined unique tokens
 }
+
+/**
+ * Memex Leaderboard API Types
+ * Based on: https://app.memex.xyz/api/leaderboard/public/rank/v2.1/getRank
+ */
+export interface MemexLeaderboardUser {
+  id: number;
+  profileImageUrl: string;
+  tokenImageUrl: string;
+  userName: string;
+  userNameTag: string;
+  displayName: string;
+}
+
+export interface MemexLeaderboardToken {
+  id: number;
+  tokenAddress: string;
+  tokenName: string;
+  tokenSymbol: string;
+  tokenPriceNow: string;
+  tokenPrice24hChange: number;
+  age: string;
+  transactions: number;
+  volume: number;
+  holder: number;
+  updatedAt: string;
+  bondingCurveProgress: number;
+  isTargetPriceReached: boolean;
+  user: MemexLeaderboardUser;
+  tokenUsdPriceNow: string;
+  tokenUsdPrice24hChange: number;
+  tokenUsdPrice24hChangePercent: number;
+  isCexListed: boolean;
+}
+
+export interface MemexLeaderboardResponse {
+  data: MemexLeaderboardToken[];
+  hasNextPage: boolean;
+  nextCursor: number | null;
+  rankUpdatedAt: string;
+  tokenUsdPriceUpdatedAt: string;
+}
+
+/**
+ * Token image mapping cache
+ */
+export interface TokenImageInfo {
+  tokenSymbol: string;
+  tokenName: string;
+  tokenAddress: string;
+  imageSrc: string;
+  bondingCurveProgress: number;
+  tokenPriceUsd: string;
+  updatedAt: Date;
+}
+
+
+
+
+

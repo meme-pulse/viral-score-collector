@@ -110,21 +110,22 @@ export class ScoreCalculator {
   /**
    * Calculate time decay factor
    * Newer posts get higher weight, older posts decay exponentially
+   * Posts older than 7 days get 100% decay (score = 0)
    */
   calculateTimeDecay(latestPostTime: Date): number {
     const now = Date.now();
     const postTime = latestPostTime.getTime();
     const ageHours = (now - postTime) / (1000 * 60 * 60);
 
-    // If post is too old, return minimal weight
+    // If post is too old (> 7 days), return 0 (100% decay)
     if (ageHours > MAX_AGE_HOURS) {
-      return 0.1;
+      return 0;
     }
 
     // Exponential decay: e^(-t / halfLife)
     const decayFactor = Math.exp((-ageHours * Math.LN2) / TIME_DECAY_HALF_LIFE_HOURS);
 
-    return Math.max(0.1, decayFactor); // Minimum 10% weight
+    return decayFactor; // No minimum - can decay to 0
   }
 
   /**
@@ -319,3 +320,9 @@ export class ScoreCalculator {
 
 // Singleton instance with default weights
 export const scoreCalculator = new ScoreCalculator();
+
+
+
+
+
+

@@ -2,9 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { scoreRoutes } from './routes/score';
-import { merkleRoutes } from './routes/merkle';
 import { startScheduler, stopScheduler, getSchedulerStatus } from './jobs/scheduler';
-import { websocketHandlers, getWebSocketStats } from './ws/stream';
 import { checkDatabaseConnection, closeDatabaseConnection } from './db/client';
 
 // Create Hono app
@@ -25,13 +23,11 @@ app.use(
 app.get('/', (c) => {
   return c.json({
     name: 'Viral Score Server',
-    version: '1.0.0',
+    version: '2.0.0',
     status: 'running',
     endpoints: {
       health: '/health',
       scores: '/api/score',
-      merkle: '/api/merkle',
-      websocket: '/ws',
     },
   });
 });
@@ -40,20 +36,17 @@ app.get('/', (c) => {
 app.get('/health', async (c) => {
   const dbHealthy = await checkDatabaseConnection();
   const schedulerStatus = getSchedulerStatus();
-  const wsStats = getWebSocketStats();
 
   return c.json({
     status: dbHealthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     database: dbHealthy ? 'connected' : 'disconnected',
     scheduler: schedulerStatus,
-    websocket: wsStats,
   });
 });
 
 // API Routes
 app.route('/api/score', scoreRoutes);
-app.route('/api/merkle', merkleRoutes);
 
 // 404 handler
 app.notFound((c) => {
@@ -69,35 +62,6 @@ app.onError((err, c) => {
 // Server configuration
 const PORT = parseInt(process.env.PORT || '3001');
 
-// Global server instance for WebSocket upgrades (set by Bun's HMR)
-declare global {
-  var __serverInstance: ReturnType<typeof Bun.serve> | undefined;
-}
-
-// Create fetch handler that wraps app.fetch and handles WebSocket upgrades
-function createFetchHandler(server: ReturnType<typeof Bun.serve>) {
-  return async (request: Request): Promise<Response> => {
-    const url = new URL(request.url);
-
-    // Handle WebSocket upgrades
-    if (url.pathname === '/ws') {
-      const success = server.upgrade(request, {
-        data: {
-          subscribedPools: new Set<string>(),
-          subscribeAll: false,
-        },
-      });
-      if (success) {
-        return undefined as any; // Bun handles the response
-      }
-      return new Response('WebSocket upgrade failed', { status: 400 });
-    }
-
-    // Handle regular HTTP requests
-    return app.fetch(request);
-  };
-}
-
 // Initialize database connection and start scheduler (only once)
 let initialized = false;
 async function initialize() {
@@ -107,11 +71,11 @@ async function initialize() {
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
 ║                    VIRAL SCORE SERVER                          ║
-║                        v1.0.0                                  ║
+║                        v2.0.0                                  ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  Collecting social data from Memex                            ║
-║  Calculating viral scores for DeFi pools                      ║
-║  Providing signed scores for on-chain verification            ║
+║  Calculating viral scores for meme tokens                     ║
+║  Submitting top performers to ViralScoreReporter              ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
 
@@ -124,7 +88,7 @@ async function initialize() {
   }
   console.log('[Server] ✅ Database connected');
 
-  // Start scheduler (includes initial backfill)
+  // Start scheduler
   startScheduler();
 }
 
@@ -143,23 +107,13 @@ process.on('SIGTERM', gracefulShutdown);
 // Initialize on module load
 await initialize();
 
-// Server configuration
-// Bun will automatically start the server with this config (both in dev and production)
+// Server configuration for Bun
 const serverConfig = {
   port: PORT,
-  fetch: (request: Request, server: ReturnType<typeof Bun.serve>) => {
-    // Store server instance globally for WebSocket upgrades
-    globalThis.__serverInstance = server;
-    // Use the fetch handler that wraps app.fetch
-    return createFetchHandler(server)(request);
-  },
-  websocket: websocketHandlers,
+  fetch: app.fetch,
 };
 
 console.log(`[Server] 🚀 HTTP server running on http://localhost:${PORT}`);
-console.log(`[Server] 🔌 WebSocket server running on ws://localhost:${PORT}/ws`);
 console.log('[Server] Ready to collect viral scores!');
 
-// Export server config - Bun will automatically start the server
-// In watch mode, Bun's HMR will manage server restarts
 export default serverConfig;

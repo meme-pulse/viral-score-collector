@@ -1,36 +1,24 @@
 import { Hono } from 'hono';
-import { db, schema } from '../db/client';
-import { eq, desc } from 'drizzle-orm';
-import { ScoreSigner } from '../services/signer';
 import { scoreCalculator } from '../services/score-calculator';
-import { getLatestTokenScores, getPairScore, signPairScore } from '../jobs/scheduler';
+import { memexCollector } from '../services/memex-collector';
+import { getLatestTokenScores, triggerBackfill, getSchedulerStatus, triggerTokenImageRefresh, triggerEpochSubmission, getEpochStatus } from '../jobs/scheduler';
+import { isBlacklisted } from '../constants/token-blacklist';
 
 export const scoreRoutes = new Hono();
 
-/**
- * GET /api/score/signer
- * Get the signer address for verification
- */
-scoreRoutes.get('/signer', async (c) => {
-  try {
-    const { scoreSigner } = await import('../services/signer');
-    return c.json({
-      signerAddress: scoreSigner.getSignerAddress(),
-    });
-  } catch (error) {
-    console.error('[ScoreRoute] Error getting signer:', error);
-    return c.json({ error: 'Internal server error' }, 500);
-  }
-});
+// =============================================================================
+// TOKEN SCORE ENDPOINTS
+// =============================================================================
 
 /**
  * GET /api/score/tokens
- * Get all current token scores (in-memory, not signed)
+ * Get all current token scores (in-memory, excluding blacklisted)
  */
 scoreRoutes.get('/tokens', async (c) => {
   try {
     const tokenScores = getLatestTokenScores();
     const tokens = Array.from(tokenScores.entries())
+      .filter(([symbol]) => !isBlacklisted(symbol))
       .map(([symbol, score]) => ({
         tokenSymbol: symbol,
         score,
@@ -50,25 +38,46 @@ scoreRoutes.get('/tokens', async (c) => {
 
 /**
  * GET /api/score/tokens/leaderboard
- * Get top scoring tokens
+ * Get top scoring tokens with detailed stats
  */
 scoreRoutes.get('/tokens/leaderboard', async (c) => {
   const limit = parseInt(c.req.query('limit') || '20');
 
   try {
     const tokenScores = getLatestTokenScores();
+    const allStats = await memexCollector.getAllTokenStats();
+    const imageCacheStatus = memexCollector.getTokenImageCacheStatus();
+
     const leaderboard = Array.from(tokenScores.entries())
-      .map(([symbol, score], index) => ({
-        tokenSymbol: symbol,
-        score,
-        tier: scoreCalculator.getScoreTier(score),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, Math.min(limit, 50))
+      .filter(([symbol]) => !isBlacklisted(symbol))
+      .map(([symbol, score]) => {
+        const stats = allStats.get(symbol) || {
+          posts: { '1h': 0, '1d': 0, '7d': 0 },
+          views: { '1h': 0, '1d': 0, '7d': 0 },
+          likes: { '1h': 0, '1d': 0, '7d': 0 },
+        };
+
+        const imageInfo = memexCollector.getTokenImageInfo(symbol);
+        const pulseScore = Math.round(score / 100);
+
+        return {
+          tokenSymbol: symbol,
+          imageSrc: imageInfo?.imageSrc ?? null,
+          tokenName: imageInfo?.tokenName ?? null,
+          posts: stats.posts,
+          views: stats.views,
+          likes: stats.likes,
+          pulseScore,
+        };
+      })
+      .sort((a, b) => b.pulseScore - a.pulseScore)
+      .slice(0, Math.min(limit, 100))
       .map((item, index) => ({ rank: index + 1, ...item }));
 
     return c.json({
       count: leaderboard.length,
+      updatedAt: new Date().toISOString(),
+      imageCacheUpdatedAt: imageCacheStatus.updatedAt?.toISOString() ?? null,
       leaderboard,
     });
   } catch (error) {
@@ -78,248 +87,146 @@ scoreRoutes.get('/tokens/leaderboard', async (c) => {
 });
 
 // =============================================================================
-// PAIR POOL ENDPOINTS (for LB DEX)
+// EPOCH SUBMISSION ENDPOINTS (On-chain ViralScoreReporter)
 // =============================================================================
 
 /**
- * GET /api/score/pair/:tokenX/:tokenY
- * Get the pair score for a token pair
+ * GET /api/score/epoch/status
+ * Get current epoch status from ViralScoreReporter contract
  */
-scoreRoutes.get('/pair/:tokenX/:tokenY', async (c) => {
-  const tokenX = c.req.param('tokenX').toUpperCase();
-  const tokenY = c.req.param('tokenY').toUpperCase();
-
+scoreRoutes.get('/epoch/status', async (c) => {
   try {
-    const pairResult = getPairScore(tokenX, tokenY);
-
-    if (!pairResult) {
-      return c.json(
-        {
-          error: 'Score not found for one or both tokens',
-          tokenX,
-          tokenY,
-        },
-        404
-      );
-    }
-
-    const poolId = ScoreSigner.generatePairPoolId(tokenX, tokenY);
-
-    return c.json({
-      poolId,
-      tokenX,
-      tokenY,
-      tokenXScore: pairResult.tokenXScore,
-      tokenYScore: pairResult.tokenYScore,
-      pairScore: pairResult.pairScore,
-      tier: scoreCalculator.getScoreTier(pairResult.pairScore),
-    });
+    const status = await getEpochStatus();
+    return c.json(status);
   } catch (error) {
-    console.error('[ScoreRoute] Error getting pair score:', error);
+    console.error('[ScoreRoute] Error getting epoch status:', error);
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * POST /api/score/pair/:tokenX/:tokenY/sign
- * Sign and store a pair score for on-chain use
+ * POST /api/score/epoch/submit
+ * Manually trigger epoch submission to ViralScoreReporter contract
  */
-scoreRoutes.post('/pair/:tokenX/:tokenY/sign', async (c) => {
-  const tokenX = c.req.param('tokenX').toUpperCase();
-  const tokenY = c.req.param('tokenY').toUpperCase();
-
+scoreRoutes.post('/epoch/submit', async (c) => {
   try {
-    const signedResult = await signPairScore(tokenX, tokenY);
+    const result = await triggerEpochSubmission();
+    return c.json(result);
+  } catch (error) {
+    console.error('[ScoreRoute] Error submitting epoch:', error);
+    return c.json({ error: 'Internal server error' }, 500);
+  }
+});
 
-    if (!signedResult) {
-      return c.json(
-        {
-          error: 'Score not found for one or both tokens',
-          tokenX,
-          tokenY,
-        },
-        404
-      );
-    }
+// =============================================================================
+// TOKEN IMAGE ENDPOINTS
+// =============================================================================
 
+/**
+ * GET /api/score/images/status
+ * Get token image cache status
+ */
+scoreRoutes.get('/images/status', async (c) => {
+  try {
+    const cacheStatus = memexCollector.getTokenImageCacheStatus();
+    
     return c.json({
-      poolId: signedResult.poolId,
-      tokenX,
-      tokenY,
-      tokenXScore: signedResult.tokenXScore,
-      tokenYScore: signedResult.tokenYScore,
-      pairScore: signedResult.pairScore,
-      tier: scoreCalculator.getScoreTier(signedResult.pairScore),
-      signature: signedResult.signature,
+      cacheCount: cacheStatus.count,
+      cacheUpdatedAt: cacheStatus.updatedAt?.toISOString() ?? null,
     });
   } catch (error) {
-    console.error('[ScoreRoute] Error signing pair score:', error);
+    console.error('[ScoreRoute] Error getting image cache status:', error);
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * GET /api/score/pair/:tokenX/:tokenY/history
- * Get pair score history
+ * POST /api/score/images/refresh
+ * Manually refresh token image cache
  */
-scoreRoutes.get('/pair/:tokenX/:tokenY/history', async (c) => {
-  const tokenX = c.req.param('tokenX').toUpperCase();
-  const tokenY = c.req.param('tokenY').toUpperCase();
-  const limit = parseInt(c.req.query('limit') || '24');
-  const offset = parseInt(c.req.query('offset') || '0');
-
-  // Sort tokens for consistent lookup
-  const [sortedX, sortedY] = [tokenX, tokenY].sort();
-  const poolId = ScoreSigner.generatePairPoolId(sortedX, sortedY);
-
+scoreRoutes.post('/images/refresh', async (c) => {
   try {
-    const history = await db.query.pairScores.findMany({
-      where: eq(schema.pairScores.poolId, poolId),
-      orderBy: [desc(schema.pairScores.timestamp)],
-      limit: Math.min(limit, 100),
-      offset,
-    });
-
+    const result = await triggerTokenImageRefresh();
+    const cacheStatus = memexCollector.getTokenImageCacheStatus();
+    
     return c.json({
-      poolId,
-      tokenX: sortedX,
-      tokenY: sortedY,
-      count: history.length,
-      history: history.map((s) => ({
-        tokenXScore: s.tokenXScore,
-        tokenYScore: s.tokenYScore,
-        pairScore: s.pairScore,
-        timestamp: s.timestamp,
-        nonce: s.nonce,
-        signature: s.signature,
-        tier: scoreCalculator.getScoreTier(s.pairScore),
-        createdAt: s.createdAt,
-      })),
+      ...result,
+      cacheCount: cacheStatus.count,
+      cacheUpdatedAt: cacheStatus.updatedAt?.toISOString() ?? null,
     });
   } catch (error) {
-    console.error('[ScoreRoute] Error fetching pair history:', error);
+    console.error('[ScoreRoute] Error refreshing token images:', error);
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * GET /api/score/pair/:poolId
- * Get the latest signed score for a pair pool by poolId
+ * GET /api/score/images/:tokenSymbol
+ * Get token image info for a specific token
  */
-scoreRoutes.get('/pair/id/:poolId', async (c) => {
-  const poolId = c.req.param('poolId');
-
-  if (!poolId || !poolId.startsWith('0x')) {
-    return c.json({ error: 'Invalid poolId format' }, 400);
-  }
-
+scoreRoutes.get('/images/:tokenSymbol', async (c) => {
+  const tokenSymbol = c.req.param('tokenSymbol').toUpperCase();
+  
   try {
-    const latestScore = await db.query.pairScores.findFirst({
-      where: eq(schema.pairScores.poolId, poolId),
-      orderBy: [desc(schema.pairScores.timestamp)],
-    });
-
-    if (!latestScore) {
-      return c.json({ error: 'Score not found for this pool' }, 404);
+    const imageInfo = memexCollector.getTokenImageInfo(tokenSymbol);
+    
+    if (!imageInfo) {
+      return c.json({ error: 'Token image not found', tokenSymbol }, 404);
     }
-
+    
     return c.json({
-      poolId: latestScore.poolId,
-      tokenX: latestScore.tokenXSymbol,
-      tokenY: latestScore.tokenYSymbol,
-      tokenXScore: latestScore.tokenXScore,
-      tokenYScore: latestScore.tokenYScore,
-      pairScore: latestScore.pairScore,
-      timestamp: latestScore.timestamp,
-      nonce: latestScore.nonce,
-      signature: latestScore.signature,
-      tier: scoreCalculator.getScoreTier(latestScore.pairScore),
-      createdAt: latestScore.createdAt,
+      tokenSymbol: imageInfo.tokenSymbol,
+      tokenName: imageInfo.tokenName,
+      tokenAddress: imageInfo.tokenAddress,
+      imageSrc: imageInfo.imageSrc,
+      bondingCurveProgress: imageInfo.bondingCurveProgress,
+      tokenPriceUsd: imageInfo.tokenPriceUsd,
+      updatedAt: imageInfo.updatedAt.toISOString(),
     });
   } catch (error) {
-    console.error('[ScoreRoute] Error fetching pair score:', error);
+    console.error('[ScoreRoute] Error getting token image:', error);
+    return c.json({ error: 'Internal server error' }, 500);
+  }
+});
+
+// =============================================================================
+// BACKFILL ENDPOINT
+// =============================================================================
+
+/**
+ * POST /api/score/backfill
+ * Trigger historical data backfill (runs in background)
+ */
+scoreRoutes.post('/backfill', async (c) => {
+  try {
+    const result = triggerBackfill();
+    const status = getSchedulerStatus();
+
+    return c.json({
+      ...result,
+      backfillCompleted: status.backfillCompleted,
+      backfillInProgress: status.backfillInProgress,
+    });
+  } catch (error) {
+    console.error('[ScoreRoute] Error triggering backfill:', error);
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
 
 /**
- * POST /api/score/pair/register
- * Register a new pair pool for tracking
+ * GET /api/score/backfill/status
+ * Get backfill status
  */
-scoreRoutes.post('/pair/register', async (c) => {
+scoreRoutes.get('/backfill/status', async (c) => {
   try {
-    const body = await c.req.json();
-    const { tokenXSymbol, tokenYSymbol, tokenXAddress, tokenYAddress } = body;
-
-    if (!tokenXSymbol || !tokenYSymbol) {
-      return c.json({ error: 'tokenXSymbol and tokenYSymbol are required' }, 400);
-    }
-
-    // Sort tokens for consistent ID
-    const [sortedX, sortedY] = [tokenXSymbol.toUpperCase(), tokenYSymbol.toUpperCase()].sort();
-    const poolId = ScoreSigner.generatePairPoolId(sortedX, sortedY);
-
-    // Check if already exists
-    const existing = await db.query.pairPools.findFirst({
-      where: eq(schema.pairPools.poolId, poolId),
-    });
-
-    if (existing) {
-      return c.json({
-        message: 'Pair pool already registered',
-        poolId,
-        tokenX: existing.tokenXSymbol,
-        tokenY: existing.tokenYSymbol,
-      });
-    }
-
-    // Insert new pair pool
-    await db.insert(schema.pairPools).values({
-      poolId,
-      tokenXSymbol: sortedX,
-      tokenYSymbol: sortedY,
-      tokenXAddress,
-      tokenYAddress,
-    });
-
+    const status = getSchedulerStatus();
     return c.json({
-      message: 'Pair pool registered successfully',
-      poolId,
-      tokenX: sortedX,
-      tokenY: sortedY,
+      backfillCompleted: status.backfillCompleted,
+      backfillInProgress: status.backfillInProgress,
+      tokenScoresCount: status.tokenScoresCount,
     });
   } catch (error) {
-    console.error('[ScoreRoute] Error registering pair pool:', error);
-    return c.json({ error: 'Internal server error' }, 500);
-  }
-});
-
-/**
- * GET /api/score/pairs
- * Get all registered pair pools
- */
-scoreRoutes.get('/pairs', async (c) => {
-  const limit = parseInt(c.req.query('limit') || '50');
-  const offset = parseInt(c.req.query('offset') || '0');
-
-  try {
-    const pairs = await db.query.pairPools.findMany({
-      orderBy: [desc(schema.pairPools.createdAt)],
-      limit: Math.min(limit, 100),
-      offset,
-    });
-
-    return c.json({
-      count: pairs.length,
-      pairs: pairs.map((p) => ({
-        poolId: p.poolId,
-        tokenX: p.tokenXSymbol,
-        tokenY: p.tokenYSymbol,
-        createdAt: p.createdAt,
-      })),
-    });
-  } catch (error) {
-    console.error('[ScoreRoute] Error fetching pairs:', error);
+    console.error('[ScoreRoute] Error getting backfill status:', error);
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
