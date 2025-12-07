@@ -8,6 +8,7 @@ import {
   triggerTokenImageRefresh,
   triggerEpochSubmission,
   getEpochStatus,
+  getPredictedEpochSubmission,
 } from '../jobs/scheduler';
 import { isBlacklisted } from '../constants/token-blacklist';
 
@@ -107,6 +108,20 @@ scoreRoutes.get('/epoch/status', async (c) => {
     return c.json(status);
   } catch (error) {
     console.error('[ScoreRoute] Error getting epoch status:', error);
+    return c.json({ error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * GET /api/score/epoch/prediction
+ * Get predicted next epoch submission list (top 3 tokens and viral pairs)
+ */
+scoreRoutes.get('/epoch/prediction', async (c) => {
+  try {
+    const prediction = await getPredictedEpochSubmission();
+    return c.json(prediction);
+  } catch (error) {
+    console.error('[ScoreRoute] Error getting epoch prediction:', error);
     return c.json({ error: 'Internal server error' }, 500);
   }
 });

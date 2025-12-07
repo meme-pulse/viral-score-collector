@@ -223,10 +223,10 @@ export class MemexCollector {
     const usersByToken = new Map<string, Set<number>>();
 
     for (const post of dbPosts) {
-      // Parse stored token arrays
-      const mentions: string[] = post.mentionedTokens ? JSON.parse(post.mentionedTokens) : [];
-      const tickers: string[] = post.extractedTickers ? JSON.parse(post.extractedTickers) : [];
-      const hashtags: string[] = post.extractedHashtags ? JSON.parse(post.extractedHashtags) : [];
+      // Parse stored token arrays and normalize to uppercase for consistency
+      const mentions: string[] = post.mentionedTokens ? JSON.parse(post.mentionedTokens).map((t: string) => t.toUpperCase()) : [];
+      const tickers: string[] = post.extractedTickers ? JSON.parse(post.extractedTickers).map((t: string) => t.toUpperCase()) : [];
+      const hashtags: string[] = post.extractedHashtags ? JSON.parse(post.extractedHashtags).map((t: string) => t.toUpperCase()) : [];
       const allTokens = [...new Set([...mentions, ...tickers, ...hashtags])];
 
       for (const token of allTokens) {
@@ -284,7 +284,7 @@ export class MemexCollector {
     for (const [token, m] of metrics.entries()) {
       const uniqueUserCount = usersByToken.get(token)?.size ?? 0;
       aggregated.push({
-        tokenSymbol: m.tokenSymbol,
+        tokenSymbol: m.tokenSymbol.toUpperCase(), // Normalize to uppercase for consistent matching
         posts: m.posts,
         views: m.views,
         likes: m.likes,
@@ -310,7 +310,7 @@ export class MemexCollector {
    */
   toAggregatedMetrics(metrics: Map<string, TokenMetrics>): AggregatedMetrics[] {
     return Array.from(metrics.values()).map((m) => ({
-      tokenSymbol: m.tokenSymbol,
+      tokenSymbol: m.tokenSymbol.toUpperCase(), // Normalize to uppercase for consistent matching
       posts: m.posts,
       views: m.views,
       likes: m.likes,
@@ -1024,8 +1024,3 @@ export class MemexCollector {
 
 // Singleton instance
 export const memexCollector = new MemexCollector();
-
-
-
-
-

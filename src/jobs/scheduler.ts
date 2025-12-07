@@ -52,8 +52,10 @@ async function processScoreCollection(): Promise<void> {
     const scores = scoreCalculator.calculateBatch(aggregatedMetrics);
 
     for (const [tokenSymbol, score] of scores) {
-      latestTokenScores.set(tokenSymbol, score);
-      console.log(`[Scheduler] ${tokenSymbol}: score=${score}, tier=${scoreCalculator.getScoreTier(score)}`);
+      // Normalize token symbol to uppercase for consistent matching
+      const normalizedSymbol = tokenSymbol.toUpperCase();
+      latestTokenScores.set(normalizedSymbol, score);
+      console.log(`[Scheduler] ${normalizedSymbol}: score=${score}, tier=${scoreCalculator.getScoreTier(score)}`);
     }
 
     latestAggregatedMetrics = aggregatedMetrics;
@@ -541,7 +543,8 @@ async function processHourlySnapshot(): Promise<void> {
 
     const metricsMap = new Map<string, AggregatedMetrics>();
     for (const m of latestAggregatedMetrics) {
-      metricsMap.set(m.tokenSymbol, m);
+      // Normalize token symbol to uppercase for consistent matching
+      metricsMap.set(m.tokenSymbol.toUpperCase(), m);
     }
 
     const snapshots = Array.from(latestTokenScores.entries()).map(([tokenSymbol, score]) => {
@@ -874,5 +877,107 @@ export async function getEpochStatus(): Promise<{
   } catch (error) {
     console.error('[Scheduler] Failed to get epoch status:', error);
     return { ready: false, signerAddress: null, currentEpoch: '0', lastEpoch: '0', canSubmit: false, activePairs: 0 };
+  }
+}
+
+/**
+ * Get predicted next epoch submission list
+ * Returns the top 3 tokens and their viral pairs that would be submitted
+ */
+export async function getPredictedEpochSubmission(): Promise<{
+  currentEpoch: string;
+  nextEpoch: string;
+  canSubmit: boolean;
+  rankings: Array<{
+    rank: number;
+    tokenAddress: string;
+    tokenSymbol: string | null;
+    tokenName: string | null;
+    quoteTokenAddress: string;
+    score: number;
+    binSteps: Array<{ binStep: number; tvlUSD: number }>;
+    protocolShare: number;
+  }>;
+  viralPairs: Array<{
+    rank: 1 | 2 | 3;
+    tokenX: string;
+    tokenY: string;
+    binStep: number;
+    protocolShare: number;
+  }>;
+  dataSource: 'snapshot' | 'current';
+  snapshotHour: string | null;
+  note: string;
+}> {
+  try {
+    const { canSubmit, currentEpoch, lastEpoch } = await epochSubmitter.canSubmitNewEpoch();
+    const nextEpoch = canSubmit ? currentEpoch : currentEpoch + 1n;
+
+    // Get scores for the next epoch
+    const { scores: epochScores, fromSnapshot, snapshotHour, note } = await getEpochScores(nextEpoch);
+
+    // Build token rankings
+    const rankings = await buildTokenRankings(epochScores);
+
+    // Get token info from GraphQL for display
+    const memeTokensWithPools = await graphqlClient.getMemeTokensWithPools();
+
+    // Build detailed rankings with token info
+    const detailedRankings = rankings.slice(0, 3).map((ranking, index) => {
+      const tokenData = memeTokensWithPools.find((t) => t.tokenAddress.toLowerCase() === ranking.tokenAddress.toLowerCase());
+
+      // Protocol share calculation: Rank 1 = 10%, Rank 2 = 20%, Rank 3 = 40%
+      const protocolShares = [10, 20, 40];
+      const protocolShare = protocolShares[index] || 50;
+
+      return {
+        rank: index + 1,
+        tokenAddress: ranking.tokenAddress,
+        tokenSymbol: tokenData?.tokenSymbol ?? null,
+        tokenName: tokenData?.tokenName ?? null,
+        quoteTokenAddress: ranking.quoteTokenAddress,
+        score: ranking.score,
+        binSteps: ranking.binSteps.map((binStep) => {
+          const pool = tokenData?.pools.find((p) => p.binStep === binStep);
+          return {
+            binStep,
+            tvlUSD: pool?.tvlUSD ?? 0,
+          };
+        }),
+        protocolShare,
+      };
+    });
+
+    // Build viral pairs
+    const viralPairs = epochSubmitter.buildViralPairs(rankings.slice(0, 3));
+    const detailedPairs = viralPairs.map((pair) => {
+      const rankingIndex = rankings.findIndex(
+        (r) => r.tokenAddress.toLowerCase() === pair.tokenX.toLowerCase() && r.quoteTokenAddress.toLowerCase() === pair.tokenY.toLowerCase()
+      );
+      const protocolShares = [10, 20, 40];
+      const protocolShare = rankingIndex >= 0 && rankingIndex < 3 ? protocolShares[rankingIndex] : 50;
+
+      return {
+        rank: pair.rank,
+        tokenX: pair.tokenX,
+        tokenY: pair.tokenY,
+        binStep: pair.binStep,
+        protocolShare,
+      };
+    });
+
+    return {
+      currentEpoch: currentEpoch.toString(),
+      nextEpoch: nextEpoch.toString(),
+      canSubmit,
+      rankings: detailedRankings,
+      viralPairs: detailedPairs,
+      dataSource: fromSnapshot ? 'snapshot' : 'current',
+      snapshotHour: snapshotHour?.toISOString() ?? null,
+      note,
+    };
+  } catch (error) {
+    console.error('[Scheduler] Failed to get predicted epoch submission:', error);
+    throw error;
   }
 }

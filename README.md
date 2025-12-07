@@ -234,3 +234,4 @@ bun run start
 | 2 | 20% | 2nd viral (2 binSteps) |
 | 3 | 40% | 3rd viral (1 binStep) |
 | Default | 50% | 일반 페어 |
+
